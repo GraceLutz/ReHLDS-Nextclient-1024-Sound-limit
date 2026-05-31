@@ -1,0 +1,264 @@
+diff --git a/nextclient/engine_mini/src/client/cl_main.cpp b/nextclient/engine_mini/src/client/cl_main.cpp
+index 0010322..db75242 100644
+--- a/nextclient/engine_mini/src/client/cl_main.cpp
++++ b/nextclient/engine_mini/src/client/cl_main.cpp
+@@ -4,6 +4,7 @@
+ #include <next_engine_mini/nclm_proto.h>
+ 
+ #include "cl_private_resources.h"
++#include "cl_sound.h"
+ #include "spriteapi.h"
+ #include "../analytics.h"
+ #include "../vgui_int.h"
+@@ -241,18 +242,35 @@ bool CL_PrecacheResources()
+         switch (pResource->type)
+         {
+             case t_sound:
++            {
++                const int sndIndex = pResource->nIndex;
++                const bool highIndex = (sndIndex >= MAX_SOUNDS); // >= 512: must NOT touch cl->sound_precache (OOB)
++
+                 if (FBitSet(pResource->ucFlags, RES_WASMISSING))
+                 {
+-                    cl->sound_precache[pResource->nIndex] = nullptr;
++                    if (!highIndex)
++                        cl->sound_precache[sndIndex] = nullptr;
++                    else
++                        S_SoundEx_Store(sndIndex, nullptr);
+                     SetBits(pResource->ucFlags, RES_PRECACHED);
+                     break;
+                 }
+ 
+                 S_BeginPrecaching();
+-                cl->sound_precache[pResource->nIndex] = S_PrecacheSound(pResource->szFileName);
++                sfx_t* sfx = S_PrecacheSound(pResource->szFileName);
+                 S_EndPrecaching();
+ 
+-                if (cl->sound_precache[pResource->nIndex] || !FBitSet(pResource->ucFlags, RES_FATALIFMISSING))
++                if (highIndex)
++                {
++                    S_SoundEx_Store(sndIndex, sfx); // Phase 1: store >=512 in the expanded table
++                }
++                else
++                {
++                    cl->sound_precache[sndIndex] = sfx;
++                }
++
++                const bool ok = highIndex ? (sfx != nullptr) : (cl->sound_precache[sndIndex] != nullptr);
++                if (ok || !FBitSet(pResource->ucFlags, RES_FATALIFMISSING))
+                 {
+                     SetBits(pResource->ucFlags, RES_PRECACHED);
+                     break;
+@@ -261,6 +279,7 @@ bool CL_PrecacheResources()
+                 COM_ExplainDisconnection(true, "Cannot continue without sound %s, disconnecting.", pResource->szFileName);
+                 CL_Disconnect();
+                 return false;
++            }
+ 
+             case t_skin:
+             case t_generic:
+diff --git a/nextclient/engine_mini/src/client/cl_sound.cpp b/nextclient/engine_mini/src/client/cl_sound.cpp
+index d8ccbb5..70b06e8 100644
+--- a/nextclient/engine_mini/src/client/cl_sound.cpp
++++ b/nextclient/engine_mini/src/client/cl_sound.cpp
+@@ -2,6 +2,10 @@
+ #include "../common/zone.h"
+ #include "../common/com_strings.h"
+ #include "optick.h"
++#include "cl_sound.h"
++#include "../common/sys_dll.h"
++#include <nitroapi/modules/engine/enginemsg.h>
++#include <array>
+ 
+ sfx_t* S_PrecacheSound(char* sample)
+ {
+@@ -38,3 +42,149 @@ void S_UnloadSounds(const std::unordered_set<std::string>& names)
+         sfx->name[0] = '\0';
+     }
+ }
++
++// --- Phase-0 mixer spike: engine_mini-owned sfx pool ---
++// Mirrors the model precedent (mod_known[1024] + Mod_FindName replace). Bypasses hw.dll's capped
++// known_sfx[] (which fatal-errors "S_FindName: out of sfx_t" past ~MAX_SFX). The returned sfx_t
++// lives in engine_mini memory; if hw.dll's mixer plays it correctly, foreign sfx_t is validated.
++namespace {
++    constexpr int kMaxSfxEx = 2048;
++    std::array<sfx_t, kMaxSfxEx> g_sfx_ex{};
++    int g_num_sfx_ex = 0;
++}
++
++void S_FindName_Ex_Reset()
++{
++    for (int i = 0; i < g_num_sfx_ex; i++)
++    {
++        if (Cache_Check(&g_sfx_ex[i].cache))
++            Cache_Free(&g_sfx_ex[i].cache);
++        g_sfx_ex[i].cache.data = nullptr;
++        g_sfx_ex[i].name[0] = '\0';
++    }
++    g_num_sfx_ex = 0;
++}
++
++sfx_t* S_FindName_Ex(const char* name, int* pfInCache)
++{
++    if (!name || !name[0])
++        Sys_Error("S_FindName_Ex: NULL/empty name");
++    if (Q_strlen(name) >= MAX_QPATH)
++        Sys_Error("S_FindName_Ex: sound name too long: %s", name);
++
++    for (int i = 0; i < g_num_sfx_ex; i++)
++    {
++        if (!Q_stricmp(g_sfx_ex[i].name, name))
++        {
++            if (pfInCache)
++                *pfInCache = (g_sfx_ex[i].cache.data != nullptr) ? 1 : 0;
++            return &g_sfx_ex[i];
++        }
++    }
++
++    if (g_num_sfx_ex >= kMaxSfxEx)
++        Sys_Error("S_FindName_Ex: out of sfx_t (ex pool, %d)", kMaxSfxEx);
++
++    sfx_t* sfx = &g_sfx_ex[g_num_sfx_ex++];
++    Q_memset(sfx, 0, sizeof(sfx_t));
++    Q_strncpy(sfx->name, name, MAX_QPATH - 1);
++    sfx->name[MAX_QPATH - 1] = '\0';
++    if (pfInCache)
++        *pfInCache = 0;
++    return sfx;
++}
++
++// --- Phase 1: expanded sound precache index table (indices 512..1023) + svc_sound takeover ---
++namespace {
++    std::array<sfx_t*, MAX_SOUNDS_EX> g_sound_precache_ex{};
++
++    // Reconstruct hw.dll's MSG_ReadBitCoord (mirror of ReHLDS MSG_WriteBitCoord, common.cpp:852).
++    float ReadBitCoord_Ex()
++    {
++        float value = 0.0f;
++        int hasInt  = eng()->MSG_ReadBits(1);
++        int hasFrac = eng()->MSG_ReadBits(1);
++        if (hasInt || hasFrac)
++        {
++            int sign    = eng()->MSG_ReadBits(1);
++            int intval  = hasInt  ? eng()->MSG_ReadBits(12) : 0;
++            int fracval = hasFrac ? eng()->MSG_ReadBits(3)  : 0;
++            value = intval + fracval * 0.125f;
++            if (sign) value = -value;
++        }
++        return value;
++    }
++
++    // Mirror of MSG_ReadBitVec3Coord (common.cpp:871).
++    void ReadBitVec3Coord_Ex(vec3_t out)
++    {
++        out[0] = out[1] = out[2] = 0.0f;
++        int xf = eng()->MSG_ReadBits(1);
++        int yf = eng()->MSG_ReadBits(1);
++        int zf = eng()->MSG_ReadBits(1);
++        if (xf) out[0] = ReadBitCoord_Ex();
++        if (yf) out[1] = ReadBitCoord_Ex();
++        if (zf) out[2] = ReadBitCoord_Ex();
++    }
++}
++
++void S_SoundEx_Store(int index, sfx_t* sfx)
++{
++    if (index >= 0 && index < MAX_SOUNDS_EX)
++        g_sound_precache_ex[index] = sfx;
++}
++
++void S_SoundEx_Reset()
++{
++    g_sound_precache_ex.fill(nullptr);
++}
++
++// Parses svc_sound exactly like the server writer SV_BuildSoundMsg (sv_main.cpp:786-799).
++// Returns true if it fully handled a HIGH-index (>=MAX_SOUNDS) sound; returns false (with the
++// message read-cursor rewound to the start) for sentences and indices < MAX_SOUNDS, so the caller
++// can delegate to hw.dll's original handler.
++bool CL_SvcSound_HandleHigh()
++{
++    const int rc = *pMsg_readcount;
++    eng()->MSG_StartBitReading(net_message);
++
++    int field_mask = eng()->MSG_ReadBits(9);
++
++    int volume    = DEFAULT_SOUND_PACKET_VOLUME;
++    int atten_raw = 0;
++    if (field_mask & SND_FL_VOLUME)      volume    = eng()->MSG_ReadBits(8);
++    if (field_mask & SND_FL_ATTENUATION) atten_raw = eng()->MSG_ReadBits(8);
++
++    int channel   = eng()->MSG_ReadBits(3);
++    int entity    = eng()->MSG_ReadBits(MAX_EDICT_BITS);
++    int sound_num = (field_mask & SND_FL_LARGE_INDEX) ? eng()->MSG_ReadBits(16) : eng()->MSG_ReadBits(8);
++
++    // Delegate sentences (VOX) and the normal 0..511 path to hw.dll (rewind first).
++    if ((field_mask & SND_FL_SENTENCE) || sound_num < MAX_SOUNDS)
++    {
++        eng()->MSG_EndBitReading(net_message);
++        *pMsg_readcount = rc;
++        return false;
++    }
++
++    vec3_t origin;
++    ReadBitVec3Coord_Ex(origin);
++
++    int pitch = DEFAULT_SOUND_PACKET_PITCH;
++    if (field_mask & SND_FL_PITCH)
++        pitch = eng()->MSG_ReadBits(8);
++
++    eng()->MSG_EndBitReading(net_message);
++
++    sfx_t* sfx = (sound_num < MAX_SOUNDS_EX) ? g_sound_precache_ex[sound_num] : nullptr;
++    if (sfx)
++    {
++        float fvol  = volume / 255.0f;
++        float atten = (field_mask & SND_FL_ATTENUATION) ? (atten_raw / 64.0f) : DEFAULT_SOUND_PACKET_ATTENUATION;
++        if (channel == CHAN_STATIC)
++            eng()->S_StartStaticSound(entity, channel, sfx, origin, fvol, atten, field_mask, pitch);
++        else
++            eng()->S_StartDynamicSound(entity, channel, sfx, origin, fvol, atten, field_mask, pitch);
++    }
++    return true;
++}
+diff --git a/nextclient/engine_mini/src/client/cl_sound.h b/nextclient/engine_mini/src/client/cl_sound.h
+index 13024b4..0dcc160 100644
+--- a/nextclient/engine_mini/src/client/cl_sound.h
++++ b/nextclient/engine_mini/src/client/cl_sound.h
+@@ -3,3 +3,14 @@
+ #include <unordered_set>
+ 
+ void S_UnloadSounds(const std::unordered_set<std::string>& names);
++
++// --- Phase-0 mixer spike: engine_mini-owned sfx pool (replaces hw.dll's capped known_sfx[]) ---
++struct sfx_t;
++sfx_t* S_FindName_Ex(const char* name, int* pfInCache);
++void   S_FindName_Ex_Reset();
++
++// --- Phase 1: expanded sound precache index table (indices 512..1023) + svc_sound takeover ---
++#define MAX_SOUNDS_EX 1024
++void S_SoundEx_Store(int index, sfx_t* sfx);
++void S_SoundEx_Reset();
++bool CL_SvcSound_HandleHigh(); // true if it handled a >=512 sound; false => caller delegates
+diff --git a/nextclient/engine_mini/src/engine.cpp b/nextclient/engine_mini/src/engine.cpp
+index d6aa0ea..273d08c 100644
+--- a/nextclient/engine_mini/src/engine.cpp
++++ b/nextclient/engine_mini/src/engine.cpp
+@@ -24,6 +24,7 @@
+ #include "graphics/detailtexture.h"
+ #include "client/client.h"
+ #include "client/cl_main.h"
++#include "client/cl_sound.h"
+ #include "client/download.h"
+ #include "client/spriteapi.h"
+ #include "client/cl_private_resources.h"
+@@ -397,6 +398,8 @@ static void OnGameInitializing(void* mainwindow, HDC* pmaindc, HGLRC* pbaseRC, c
+     g_Unsubs.emplace_back(eng()->Host_FilterTime             |= [](float delay, const auto& next)                                      { return Host_FilterTime(delay); });
+     g_Unsubs.emplace_back(eng()->Mod_ClearAll                |= [](const auto& next)                                                   { Mod_ClearAll(); });
+     g_Unsubs.emplace_back(eng()->Mod_FindName                |= [](qboolean trackCRC, const char* name, const auto& next)              { return Mod_FindName(trackCRC, name); });
++    g_Unsubs.emplace_back(eng()->S_FindName                  |= [](const char* name, int* pfInCache, const auto& next)                 { return S_FindName_Ex(name, pfInCache); }); // Phase-0 mixer spike
++    g_Unsubs.emplace_back(eng()->SVC_Sound                   |= [](const auto& next)                                                   { if (!CL_SvcSound_HandleHigh()) next->Invoke(); }); // Phase 1: resolve >=512 sound indices
+     g_Unsubs.emplace_back(eng()->Mod_Print                   |= [](const auto& next)                                                   { Mod_Print(); });
+     g_Unsubs.emplace_back(eng()->Mod_ValidateCRC             |= [](const char* name, CRC32_t crc, const auto& next)                    { return Mod_ValidateCRC(name, crc); });
+     g_Unsubs.emplace_back(eng()->Mod_NeedCRC                 |= [](const char* name, qboolean needCRC, const auto& next)               { Mod_NeedCRC(name, needCRC); });

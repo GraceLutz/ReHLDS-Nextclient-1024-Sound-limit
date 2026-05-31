@@ -1,0 +1,26 @@
+diff --git a/rehlds/common/qlimits.h b/rehlds/common/qlimits.h
+index 1a67bd5..905688c 100644
+--- a/rehlds/common/qlimits.h
++++ b/rehlds/common/qlimits.h
+@@ -29,7 +29,7 @@ constexpr auto MAX_LIGHTSTYLE_SIZE = size_t{64};
+ // Resource counts
+ #define MAX_MODEL_INDEX_BITS		9	// sent as a short
+ #define MAX_MODELS			(1<<MAX_MODEL_INDEX_BITS)
+-#define MAX_SOUND_INDEX_BITS		9
++#define MAX_SOUND_INDEX_BITS		10
+ #define MAX_SOUNDS			(1<<MAX_SOUND_INDEX_BITS)
+ #define MAX_SOUNDS_HASHLOOKUP_SIZE	(MAX_SOUNDS * 2 - 1)
+ 
+diff --git a/rehlds/engine/sv_main.cpp b/rehlds/engine/sv_main.cpp
+index 2e85c16..5d05012 100644
+--- a/rehlds/engine/sv_main.cpp
++++ b/rehlds/engine/sv_main.cpp
+@@ -832,7 +832,7 @@ int EXT_FUNC SV_LookupSoundIndex(const char *sample)
+ 		SV_BuildHashedSoundLookupTable();
+ 	}
+ 
+-	int starting_index = SV_HashString(sample, 1023);
++	int starting_index = SV_HashString(sample, MAX_SOUNDS_HASHLOOKUP_SIZE);
+ 	index = starting_index;
+ 	while (g_psv.sound_precache_hashedlookup[index])
+ 	{
