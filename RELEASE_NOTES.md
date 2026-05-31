@@ -7,7 +7,10 @@ sounds at indices **512–1023**. Platform: **Win32 / x86**.
 ## Downloads
 - `swds.dll` — patched ReHLDS server engine (drop-in over your ReHLDS `swds.dll`).
 - `next_engine_mini.dll` — patched CS-NextClient engine module (engine build **8684**).
-- Source patches, design doc and test plugins are in the repository.
+
+The repository is organized as `release/` (prebuilt Win32 binaries), `source/` + `linux/`
+(modified source files), `patches/` (git-apply diffs), `docs/` and `test-plugins/`. See the README
+for Windows **and Linux** build instructions.
 
 ## Server (ReHLDS)
 - `MAX_SOUND_INDEX_BITS` 9 → 10 (`MAX_SOUNDS` = 1024).
